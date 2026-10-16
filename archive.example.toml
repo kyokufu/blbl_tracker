@@ -1,0 +1,19 @@
+# Existing tracker only. No schema changes, approvals, or writes.
+[discovery]
+song = "Song"
+artist = "Artist"
+publish_date = "Publish Date"
+status = "Status"
+accounts = "Published Acc."
+url = "url"
+
+[archive]
+type_property = "Type"
+notes_property = "Notes"
+date_tolerance_days = 0
+
+# Optional evidence-backed alternate spellings; never infer translations.
+# [[aliases]]
+# song = "Canonical song name"
+# alternatives = ["Known alternate title"]
+# evidence = "User-confirmed alternate title"

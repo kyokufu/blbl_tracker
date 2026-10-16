@@ -2,7 +2,8 @@
 
 Python 3.12, no third-party dependencies. Refresh Views, Likes, Favorites, Coins,
 and Last Synced on existing Notion pages, preserving schema, content, relations,
-statuses, and views. No paid hosting, historical analytics, or dashboards.
+statuses, and views. No paid hosting, engagement time-series analytics, or dashboards.
+Historical archive reconstruction is available as a separate read-only preview.
 
 **Status:** implemented and tested offline. Real schema/API compatibility,
 GitHub runner access, and account billing safeguards remain unverified. No live
@@ -126,8 +127,8 @@ Set repository **variables** in order:
 Without these confirmations, jobs are skipped before allocating a runner.
 Remove the schedule flag to stop scheduled writes, the live flag to stop all
 workflow writes, or the cost flag to stop all jobs in these workflows. Tests
-are manual-only to avoid unintended usage before billing is checked. Workflows
-have not been pushed or remotely executed during implementation.
+are manual-only to avoid unintended usage before billing is checked. Workflow
+files are versioned; remote execution and account gate settings are unverified.
 
 ## Failures, security, and fallback
 
@@ -307,3 +308,122 @@ Notion offers no assumed conditional-update/compare-and-swap API here. Do not
 edit URLs or run another writer during apply: a narrow race between the final
 read and PATCH cannot be eliminated. No Notion writes were performed during
 implementation, and no approval file has been generated automatically.
+
+## Historical archive preview (no writes)
+
+The archive addendum extends reconciliation to missing records across **all**
+upload dates and categories, including uploads before manual tracking began
+around June 2026. This is separate from engagement-history analytics. The only
+archive command currently implemented is `preview`: there is no archive
+approve/apply stage, no page creation call, no schema mutation, and no scheduled
+archive execution. Existing discovery and stats commands remain separate.
+
+```sh
+python -m blbl_tracker.archive preview \
+  --uploads uploads-account.json --config archive.example.toml \
+  --batch-size 20 --output archive-preview-001
+```
+
+The default source UUID is the confirmed
+`15a22148-d475-4b8c-8757-39678fd3437e` (database
+`4ab36326-1c5a-4b57-a179-129c4390abaa`); an explicit
+`NOTION_DATA_SOURCE_ID` overrides it. A `NOTION_TOKEN` with **read content only**
+is sufficient for this command. No write capability should be granted for
+preview. Configuration uses the six existing discovery mappings plus Type
+(select) and Notes (rich text). The confirmed title/rich-text/select/date/
+multi-select/URL types are checked; unexpected schemas fail rather than migrate.
+Copy to ignored `archive.local.toml` for private mapping/tolerance/alias changes.
+
+Source records may contain only `bvid`, `title`, and a matching `url`. Metadata
+retrieval checks owner UID 19997041 and uses **pubdate**, never ctime. Successful
+title, description, owner, original timestamp, China-local date, and valid
+optional statistics are atomically cached per BV in
+`.archive-private/metadata.json`, with fetch time. Ownership mismatch is distinct
+from a failed lookup. Each lookup's outcome is saved immediately, so completed
+work survives interruption. A failed refresh preserves previous good metadata
+and marks the refresh failure. Cache data is a local saved observation, not
+proof of current live state; preview reports its provenance and timestamps.
+
+Rerun the same command with a **new output directory** to resume. Existing
+successful/mismatched cache records are reused, failed records are retried, and
+the next unprocessed records are attempted. `--batch-size` bounds videos attempted
+(not HTTP attempts); transport still paces at one second and uses 15-second
+timeouts, up to three transient retries, and a 240-second enrichment deadline.
+HTTP 412/403/429, known application blocks, or a global network denial stops
+further requests while retaining earlier work. Ordinary application failures
+remain individual review items. There are no cookies, paid services, proxies,
+challenge bypasses, or parallel request storms.
+
+- `--offline`: use the cache only, without Bilibili requests.
+- `--refresh`: deliberately recheck successful/mismatched cache entries (no
+  automatic expiry or background requests). Process one cache writer at a time.
+- `--cache PATH`: choose a separate private cache. Do not commit it or load
+  untrusted third-party cache files; browser exports always go through `--uploads`.
+- `--notion-snapshot PATH`: use a local schema/rows snapshot instead of live
+  Notion reads. Combine with `--offline` for a completely offline preview.
+
+A snapshot is JSON containing `data_source_id`, `schema` (the source's properties
+object keyed by name), and `rows` (full Notion page objects including property
+IDs/types/values). Every successful preview saves a `notion-snapshot.json` next
+to its reports. This contains private data, is saved mode 0600, and is not an
+approval artifact. If Notion access is unavailable, successful Bilibili lookups
+are still cached before the command stops; supply a snapshot or read access
+to complete the report.
+
+Outputs in the new owner-only directory:
+
+- `preview.md`: human-readable exact identities, candidates, conflicts, URL
+  additions, rejected owners, and field-by-field historical row proposals.
+- `preview.json`: all evidence, confidences, source metadata/provenance,
+  fingerprints, stable operation IDs, typed proposed properties, and counts.
+- `preview.csv`: summary suitable for spreadsheet review, with formula-injection
+  protection on cells. JSON remains the canonical machine-readable representation.
+
+Existing BV IDs are indexed across **all** current pages, regardless of status,
+account filter, or date, before suggesting anything. Existing URLs reserve those
+videos; duplicate assignments are conflicts, never new creations. Missing-URL
+updates still require Status=Published and account B站. Matching combines
+Song/Artist, confirmed Type, verified date, and version markers. A default
+**zero-day** date tolerance is explicit; `date_tolerance_days` can be configured
+from 0 to 7, with the actual distance shown in evidence. Missing dates never
+score as agreement. Type, live/studio/re-recording mismatches prevent confident
+updates. One upload cannot be assigned to multiple rows.
+
+Unicode normalization includes composed/decomposed kana, punctuation and case,
+and `&`/`and`. No translation/transliteration is guessed. `[[aliases]]` entries
+require a canonical song, alternatives, and nonempty evidence; see the example
+configuration. A shared song alone is insufficient for a safe update.
+
+Type definitions: **Cover** is a performance without TAB clues; **Bass Tab** is
+standalone bass tablature; **Cover + Tab** requires explicit performance and
+synchronized/scrolling TAB evidence in the title/description. An `附谱` mention
+alone is uncertain. Piano, arrangements, originals, and rehearsals with explicit
+clues are Other; unknown content is left for review, not forced into a category.
+Different versions and separate cover/TAB uploads remain different BV records.
+
+Missing videos produce one new-row proposal per BV across the entire upload
+list, not only pre-June videos. Potential existing-row candidates are marked
+pending until resolved, so uncertainty never silently becomes a duplicate.
+Song/Artist are populated only when supported (e.g. quoted work title and an
+explicit original-artist annotation); otherwise values stay null with a cleaned
+source-title suggestion and review reason. Proposals use the existing tracker
+types, Published, [B站], canonical trailing-slash URL, empty Notes, and verified
+publication date. Available validated stats/Bilibili Title are proposed only
+when those exact existing properties have suitable types. No formula properties
+are included; existing notes, dates, types, and selections remain unchanged.
+
+Exit 0 means the preview completed without metadata/conflict errors, **not** that
+anything was approved or written. Exit 1 means a partial preview with pending/
+failed metadata or conflicts; exit 2 means configuration/schema/access failure.
+Counts distinguish verified/unverified metadata, exact matches, URL additions,
+creation suggestions, pending creations, skips, and errors. Refresh failures
+are visible even when prior cached metadata remains usable. User-provided
+exports are not independently proven complete; retain the full account list.
+
+All archive write/approval/idempotency-on-apply work is deferred until review
+of actual operations. Preview operation IDs are stable (`create:BV…`,
+`url:page:BV…`), and reruns against rows already containing that BV propose no
+duplicate creation. This is **proposal deduplication**, not a claim that an
+unimplemented write stage is transactionally idempotent. Future apply must
+recheck current schemas, BV identities, ownership, and approved operation details.
+No live Notion changes or additional schema properties are authorized now.
