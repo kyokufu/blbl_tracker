@@ -3,12 +3,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 from blbl_tracker.discovery import (UID, Tracker, Uploads, apply_approved, candidate,
                                     load_uploads, main, normalize, publication_day,
                                     reconcile, verify_uploads, write_private)
-from blbl_tracker.http import Blocked, GlobalError, SyncError
+from blbl_tracker.http import Blocked, GlobalError, SyncError, Transport as HttpTransport
+from test_http import http_error, response
 from test_sync import SOURCE
 
 BV = 'BV1xx411c7mD'
@@ -127,6 +129,114 @@ class MatchingTests(unittest.TestCase):
 
 
 class UploadTests(unittest.TestCase):
+    def detail(self, bvid=BV, **changes):
+        data = {'bvid': bvid, 'title': '夜に駆ける / YOASOBI (Cover)',
+                'owner': {'mid': UID}, 'pubdate': 1792108800}
+        data.update(changes)
+        return {'code': 0, 'data': data}
+
+    def browser_exports(self, records):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / 'uploads.json'
+        path.write_text(json.dumps(records, ensure_ascii=False), encoding='utf-8')
+        return load_uploads(path)
+
+    def test_minimal_browser_export_is_enriched_from_detail_api(self):
+        uploads = self.browser_exports([{'bvid': BV, 'title': 'ブラウザのタイトル',
+                                         'url': f'https://www.bilibili.com/video/{BV}'}])
+        self.assertIsNone(uploads[0]['uid'])
+        self.assertIsNone(uploads[0]['published'])
+        transport = Mock()
+        transport.request.return_value = self.detail()
+        results, failures = verify_uploads(uploads, Uploads(transport))
+        self.assertEqual(failures, [])
+        self.assertEqual(results[0]['uid'], UID)
+        self.assertEqual(results[0]['published'], publication_day(1792108800))
+        self.assertEqual(results[0]['title'], self.detail()['data']['title'])
+        self.assertTrue(results[0]['verified'])
+        transport.request.assert_called_once_with('GET', f'/x/web-interface/view?bvid={BV}')
+
+    def test_missing_uid_or_date_individually_is_enriched(self):
+        for missing in ('uid', 'published'):
+            item = video()
+            del item[missing]
+            transport = Mock()
+            transport.request.return_value = self.detail()
+            results, failures = verify_uploads(self.browser_exports([item]), Uploads(transport))
+            with self.subTest(missing=missing):
+                self.assertFalse(failures)
+                self.assertTrue(results[0]['verified'])
+                self.assertEqual(results[0]['published'], publication_day(1792108800))
+
+    def test_export_claimed_uid_does_not_override_owner_and_other_video_continues(self):
+        items = self.browser_exports([video(), video(OTHER)])
+        transport = Mock()
+        transport.request.side_effect = [self.detail(owner={'mid': 123}), self.detail(OTHER)]
+        results, failures = verify_uploads(items, Uploads(transport))
+        self.assertEqual([v['bvid'] for v in results], [OTHER])
+        self.assertEqual(failures[0]['bvid'], BV)
+        self.assertEqual(transport.request.call_count, 2)
+
+    def test_missing_or_invalid_api_pubdate_rejects_only_that_video(self):
+        for value in ('missing', None, True, 'not a date'):
+            bad = self.detail(pubdate=value)
+            if value == 'missing':
+                del bad['data']['pubdate']
+            transport = Mock()
+            transport.request.side_effect = [bad, self.detail(OTHER)]
+            items = self.browser_exports([{'bvid': BV, 'title': 'First'}, {'bvid': OTHER, 'title': 'Second'}])
+            results, failures = verify_uploads(items, Uploads(transport))
+            with self.subTest(value=value):
+                self.assertEqual([v['bvid'] for v in results], [OTHER])
+                self.assertEqual(len(failures), 1)
+
+    def test_api_lookup_failure_isolated_and_missing_video_does_not_stop_next(self):
+        for failure in (SyncError('API request failed after three attempts'), {'code': -404}):
+            transport = Mock()
+            transport.request.side_effect = [failure, self.detail(OTHER)]
+            items = self.browser_exports([{'bvid': BV, 'title': 'First'}, {'bvid': OTHER, 'title': 'Second'}])
+            results, failures = verify_uploads(items, Uploads(transport))
+            self.assertEqual([v['bvid'] for v in results], [OTHER])
+            self.assertEqual(len(failures), 1)
+
+    @patch('blbl_tracker.http.time.sleep')
+    def test_enrichment_uses_pacing_timeout_and_bounded_retries(self, sleep):
+        transport = HttpTransport('api.bilibili.com')
+        transport.opener = Mock()
+        transport.opener.open.side_effect = [http_error(503), http_error(503), http_error(503),
+                                             response(self.detail(OTHER))]
+        items = self.browser_exports([{'bvid': BV, 'title': 'First'}, {'bvid': OTHER, 'title': 'Second'}])
+        results, failures = verify_uploads(items, Uploads(transport))
+        self.assertEqual([v['bvid'] for v in results], [OTHER])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(transport.opener.open.call_count, 4)
+        self.assertEqual(transport.interval, 1.0)
+        self.assertTrue(any(call.args[0] > 0 for call in sleep.call_args_list))
+        self.assertTrue(all(0 < call.kwargs['timeout'] <= 15 for call in transport.opener.open.call_args_list))
+
+    def test_minimal_browser_exports_keep_validation_and_duplicate_detection(self):
+        item = {'bvid': BV, 'title': 'Song', 'url': f'https://www.bilibili.com/video/{BV}'}
+        with self.assertRaises(GlobalError):
+            self.browser_exports([item, item])
+        for changes in ({'bvid': 'invalid'}, {'title': ''}, {'published': 'not-a-date'},
+                        {'uid': 1}, {'url': f'https://www.bilibili.com/video/{OTHER}'},
+                        {'url': 'https://evil.test/video/' + BV}):
+            with self.subTest(changes=changes), self.assertRaises((ValueError, SyncError)):
+                self.browser_exports([item | changes])
+
+    def test_blocked_minimal_export_can_be_reported_without_a_date(self):
+        items = self.browser_exports([{'bvid': BV, 'title': video()['title']}])
+        client = Mock()
+        client.verify.side_effect = Blocked('blocked')
+        results, failures = verify_uploads(items, client)
+        notion = tracker()
+        matches = reconcile(notion, notion.rows(), results)
+        self.assertEqual(matches[0]['state'], 'unverified')
+        self.assertIsNone(matches[0]['candidates'][0]['published'])
+        self.assertIsNone(matches[0]['candidates'][0]['evidence']['date_distance_days'])
+        self.assertEqual(len(failures), 1)
+
     def test_owner_is_verified_per_video(self):
         transport = Mock()
         transport.request.return_value = {'code': 0, 'data': {'bvid': BV, 'owner': {'mid': UID},
@@ -306,6 +416,30 @@ class ApprovalTests(unittest.TestCase):
                 uploads.return_value.listing.assert_not_called()
             self.assertEqual(json.loads(path.read_text())['matches'][0]['state'], 'unverified')
             self.assertFalse(self.patches(client))
+
+    def test_minimal_browser_export_dry_run_hydrates_and_never_patches(self):
+        client = tracker()
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.toml'
+            config.write_text('[discovery]\nsong="Song"\n')
+            path, export = Path(directory) / 'report.json', Path(directory) / 'uploads.json'
+            export.write_text(json.dumps([{'bvid': BV, 'title': 'Browser title',
+                                           'url': f'https://www.bilibili.com/video/{BV}'}]))
+            transport = Mock()
+            transport.request.return_value = {'code': 0, 'data': {
+                'bvid': BV, 'title': video()['title'], 'owner': {'mid': UID},
+                'pubdate': int(datetime.fromisoformat('2026-10-16T12:00:00+08:00').timestamp())}}
+            with patch.dict('os.environ', {'NOTION_TOKEN': 'test', 'NOTION_DATA_SOURCE_ID': SOURCE}), \
+                 patch('blbl_tracker.discovery.Tracker', return_value=client), \
+                 patch('blbl_tracker.discovery.Transport', return_value=transport):
+                self.assertEqual(main(['--dry-run', '--config', str(config), '--uploads', str(export),
+                                       '--report', str(path)]), 0)
+            report = json.loads(path.read_text())
+            self.assertEqual(report['matches'][0]['state'], 'matched')
+            self.assertEqual(report['uploads'][0]['published'], '2026-10-16')
+            self.assertTrue(report['uploads'][0]['verified'])
+            self.assertFalse(self.patches(client))
+            self.assertFalse(any(c.args[0] == 'PATCH' for c in transport.request.call_args_list))
 
     def test_apply_rejects_unapproved_entry_before_any_write(self):
         client, uploads, report, approvals = self.setup_report()

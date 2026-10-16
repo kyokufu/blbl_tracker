@@ -211,13 +211,30 @@ If automatic listing is blocked, supply your own UTF-8 JSON or CSV export:
 ```
 
 This is an **illustrative format**, not an actual upload or ownership claim.
+Browser-exported JSON records containing only `bvid`, `title`, and `url` are
+also accepted, for example:
+
+```json
+[
+  {"bvid":"BV1xx411c7mD","title":"Example song / Artist (Cover)","url":"https://www.bilibili.com/video/BV1xx411c7mD"}
+]
+```
+
+Missing UID/publication date values are filled from the per-video detail API,
+using `owner.mid` and `pubdate`. The API owner must be UID 19997041 even if the
+export claims that UID or marks itself verified. The API title/date are used
+for matching. Supplied URLs must be valid Bilibili video URLs matching the BV
+ID; they are never fetched directly. Supplied invalid IDs/titles, wrong UIDs,
+invalid dates, or mismatched URLs still fail input validation.
+
 JSON can also be `{"uid":19997041,"uploads":[...]}`. CSV uses headers
 `uid,bvid,title,published` with quoted fields for commas/newlines. `mid` may
 replace `uid`; `created` may replace `published` and contain Unix seconds.
+UID and date columns may be omitted or blank in CSV as well.
 Dates accept `YYYY-MM-DD` or timezone-aware ISO timestamps; timed values are
 compared as calendar dates in Asia/Shanghai (UTC+8), the Bilibili publication
-day. Date-only Notion values are used as written. Duplicate BV IDs or wrong/
-missing UIDs are rejected. The list should contain the complete public uploads;
+day. Date-only Notion values are used as written. Duplicate BV IDs or supplied
+wrong UIDs are rejected. The list should contain the complete public uploads;
 a partial export can hide competing candidates and is not independently proven
 complete by this command.
 
@@ -229,7 +246,13 @@ python -m blbl_tracker.discovery --config discovery.local.toml \
 An export's `uid`/`verified` fields are **not** proof of ownership. Each video is
 still checked live. If blocked, an offline report can contain provisional
 `unverified` suggestions, but those cannot be applied. A definite owner mismatch
-is excluded. After access is restored, generate a fresh verified report for
+is excluded. Missing API publication dates, malformed detail responses, unavailable
+videos, and ordinary lookup failures are recorded per video; other videos are
+still processed. Requests keep one-second pacing, 15-second timeouts, and at
+most three attempts for transient errors. An explicit block/global network
+failure stops further lookups rather than hammering the endpoint. Provisional
+records without dates cannot receive date-match credit or be approved. After
+access is restored, generate a fresh verified report for
 review. Unverified or incomplete verification returns exit 1; discovery failure
 or invalid configuration returns 2. A report with ambiguity can otherwise be a
 successful read-only run; its state labels determine what can be approved.

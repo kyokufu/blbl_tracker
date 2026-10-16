@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from .bilibili import BV
+from .bilibili import BV, parse_bvid
 from .http import Blocked, GlobalError, SyncError, Transport
 from .notion import Notion, segment
 
@@ -58,17 +58,24 @@ def publication_day(value):
     return stamp.astimezone(CHINA).date().isoformat()
 
 
-def upload_record(item):
+def upload_record(item, *, allow_incomplete=False):
+    """Validate an export hint; only detail API verification proves ownership."""
     if not isinstance(item, dict):
         raise ValueError("upload must be an object")
     bvid, title = item.get("bvid"), item.get("title")
     uid = item.get("uid", item.get("mid"))
-    if isinstance(uid, bool) or str(uid) != str(UID):
+    missing_uid = uid is None or uid == ""
+    if (missing_uid and not allow_incomplete) or (not missing_uid and (isinstance(uid, bool) or str(uid) != str(UID))):
         raise ValueError("upload owner UID missing or mismatched")
     if not isinstance(bvid, str) or not BV.fullmatch(bvid) or not isinstance(title, str) or not title.strip():
         raise ValueError("invalid upload identifier/title")
-    return {"bvid": bvid, "title": title, "uid": UID,
-            "published": publication_day(item.get("published", item.get("created")))}
+    if "url" in item and item["url"] not in (None, ""):
+        if not isinstance(item["url"], str) or parse_bvid(item["url"]) != bvid:
+            raise ValueError("upload URL/BV ID mismatch")
+    published = item.get("published", item.get("created"))
+    missing_date = published is None or published == ""
+    return {"bvid": bvid, "title": title, "uid": None if missing_uid else UID,
+            "published": None if missing_date and allow_incomplete else publication_day(published)}
 
 
 def load_uploads(path):
@@ -87,7 +94,7 @@ def load_uploads(path):
             raise GlobalError("upload export must be JSON or CSV")
     if not isinstance(records, list):
         raise GlobalError("upload export must contain a list")
-    uploads = [upload_record(item) for item in records]
+    uploads = [upload_record(item, allow_incomplete=True) for item in records]
     if len({item["bvid"] for item in uploads}) != len(uploads):
         raise GlobalError("duplicate BV IDs in upload export")
     return uploads
@@ -132,6 +139,8 @@ class Uploads:
     def verify(self, item):
         """An export's UID assertion is never sufficient proof of ownership."""
         payload = self.transport.request("GET", f"/x/web-interface/view?bvid={item['bvid']}")
+        if type(payload.get("code")) is int and payload["code"] == -404:
+            raise SyncError("video unavailable")
         if type(payload.get("code")) is not int or payload["code"] != 0:
             raise Blocked("Bilibili detail unavailable (application error); ownership unverified")
         try:
@@ -236,10 +245,11 @@ def candidate(song, artist, published, video):
     if similarity < 0.65:
         return None
     artist_match = bool(artist and artist in title)
-    days = abs((date.fromisoformat(published) - date.fromisoformat(video["published"])).days) if published else None
+    days = (abs((date.fromisoformat(published) - date.fromisoformat(video["published"])).days)
+            if published and video.get("published") else None)
     score = round(65 * similarity + 20 * artist_match + (15 if days == 0 else 8 if days == 1 else 0))
     confidence = "high" if exact and artist_match and days == 0 else "medium" if exact and days in {0, 1} else "low"
-    return {"bvid": video["bvid"], "title": video["title"], "published": video["published"],
+    return {"bvid": video["bvid"], "title": video["title"], "published": video.get("published"),
             "score": score, "confidence": confidence, "owner_verified": video.get("verified") is True,
             "evidence": {"song_exact": exact, "song_similarity": round(similarity, 3),
                          "artist_in_title": artist_match, "date_distance_days": days}}
@@ -265,8 +275,8 @@ def reconcile(tracker, rows, videos):
         if candidates:
             top = candidates[0]
             ambiguous = len(candidates) > 1 and top["score"] - candidates[1]["score"] < 10
-            record["state"] = ("ambiguous" if ambiguous else "low_confidence" if top["confidence"] == "low"
-                               else "matched" if top["owner_verified"] else "unverified")
+            record["state"] = ("ambiguous" if ambiguous else "unverified" if not top["owner_verified"]
+                               else "low_confidence" if top["confidence"] == "low" else "matched")
         matches.append(record)
     # Never silently assign one upload to multiple tracker rows.
     usage = Counter(m["candidates"][0]["bvid"] for m in matches if m["candidates"])
