@@ -1,0 +1,16 @@
+# Copy to config.local.toml and map your EXISTING properties by name or ID.
+# source may be a Notion URL or rich_text property holding a URL or bare BV ID.
+[properties]
+source = "Bilibili URL"
+views = "Views"
+likes = "Likes"
+favorites = "Favorites"
+coins = "Coins"
+last_synced = "Last Synced"
+
+[published]
+property = "Published"
+# Supported: checkbox, status, select, date. No schema changes are performed.
+type = "checkbox"
+# checkbox: true; status/select: exact option name; date: omit value (nonempty).
+value = true

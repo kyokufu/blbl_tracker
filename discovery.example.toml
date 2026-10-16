@@ -1,0 +1,8 @@
+# Separate from recurring-statistics configuration. Map names or property IDs.
+[discovery]
+song = "Song"
+artist = "Artist"
+publish_date = "Publish Date"
+status = "Status"
+accounts = "Published Acc."
+url = "url"
